@@ -1,0 +1,23 @@
+##########################
+--backup from Blue-rep
+##########################
+mysqlsh --js --host=gphinblue-poc-rep.mysql.database.azure.com --port=3306 --user=sqladmin --password --ssl-mode=REQUIRED
+
+
+util.dumpSchemas(["ghbin_sampledb"], "C:\\cdc-backup\\sampledb-shell", {
+    threads: 8,
+    consistent: true
+});
+
+
+##########################
+--restore to Green-rep
+##########################
+mysqlsh --js --host=gphingreen-poc.mysql.database.azure.com --port=3306 --user=sqladmin --password --ssl-mode=REQUIRED
+
+
+util.loadDump("C:\\cdc-backup\\sampledb-shell", {
+    schema: "ghbin_newdb",
+    threads: 8,
+    loadDdl: true
+});
