@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MySQL CDC Monitor</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #182739; background: #f2f5f9; }
+    body { margin: 0 auto; padding: 28px; max-width: 1500px; }
+    h1 { margin-bottom: 6px; } .subtle { color: #52647a; }
+    .servers { display: grid; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); gap: 16px; }
+    .card { background: white; border: 1px solid #d8e0ea; border-radius: 10px; padding: 20px; margin: 18px 0; }
+    .label { text-transform: uppercase; font-size: 12px; letter-spacing: 1px; color: #52647a; }
+    .value { overflow-wrap: anywhere; margin: 8px 0; font-family: ui-monospace, monospace; }
+    .scroll { overflow-x: auto; } table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { padding: 14px 10px; border-bottom: 1px solid #e4eaf1; text-align: left; vertical-align: top; }
+    th { color: #52647a; } .badge { padding: 4px 9px; border-radius: 12px; background: #e6edf7; display: inline-block; }
+    .running { background: #dcf5e7; color: #176d3f; } .error, .needs_initialize { background: #ffe1df; color: #a62620; }
+    .initializing, .catching_up { background: #fff0c7; color: #785600; }
+    button { padding: 7px 10px; margin: 0 5px 6px 0; border: 1px solid #bbcadb; border-radius: 5px; background: white; cursor: pointer; }
+    button:hover { background: #e8f0fc; } .danger { color: #a62620; }
+    .error-text { color: #a62620; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #notice { min-height: 24px; } small { display: block; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>MySQL CDC Monitor</h1>
+  <div class="subtle">Online snapshot and binlog replication &middot; one or two destinations per source</div>
+  <div id="notice" role="status" aria-live="polite"></div>
+  <div id="servers" class="servers"></div>
+  <section class="card">
+    <h2>Lag and cutover</h2>
+    <div id="progress" role="status" aria-live="polite">Waiting for source progress...</div>
+    <p id="cutover" class="value">No source barrier captured.</p>
+    <button id="capture-cutover">Capture source cutover position</button>
+    <p class="subtle">Before capture: stop primary writes (including test generators), finish in-flight transactions,
+      and verify primary-to-read-replica catch-up separately. This monitor checks only the configured source endpoint
+      to mapped targets, not upstream replication, unconfigured tables, or referential integrity.</p>
+    <small class="subtle">A green result is a sampled observation, not a write fence. Keep writes stopped.
+      The captured barrier is cleared when the application restarts.</small>
+  </section>
+  <section class="card">
+    <h2>Table replication</h2>
+    <p class="subtle">Pause before reinitializing. Initialize deletes all mapped target table contents and copies the source again.
+      Targets are not consistent until catch-up completes.</p>
+    <button id="pause-all">Pause all tables</button>
+    <button id="initialize-all" class="danger">Initialize all tables</button>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Source / destinations</th><th>Status</th><th>Snapshot rows</th><th>CDC changes</th>
+          <th>Committed source checkpoint</th><th>Binlog backlog</th><th>Cutover barrier</th>
+          <th>Last applied source event (UTC)</th><th>Actions</th></tr></thead>
+        <tbody id="tables"></tbody>
+      </table>
+    </div>
+    <small class="subtle">Counts are per source row, not multiplied by destination count. Snapshot count is exact;
+      no approximate percentage is shown. CDC count includes snapshot-overlap replay.</small>
+    <small class="subtle">Backlog is source-server-wide log bytes/files to scan, including unrelated table events.
+      It is not pending row count, time lag, or an ETA. Only committed checkpoints are measured.</small>
+  </section>
+  <p class="subtle">Server binlog heads are independent coordinates, not directly comparable.
+    The target head is server-wide activity, not a per-table apply position. Checkpoints are committed with all mapped target writes.</p>
+  <p id="updated" class="subtle"></p>
+  <script>
+    const el = (tag, text, cls) => {
+      const node = document.createElement(tag);
+      if (text !== undefined) node.textContent = text;
+      if (cls) node.className = cls;
+      return node;
+    };
+    const position = p => p ? `${p.file}:${p.position}` : "Not available";
+    async function send(url, body) {
+      const response = await fetch(url, {
+        method: "POST", headers: {"Content-Type": "application/json", "X-CDC-Action": "1"},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      document.getElementById("notice").textContent = data.message;
+    }
+    async function command(table, action) {
+      const body = {};
+      if (action === "initialize") {
+        const confirmation = prompt(`This deletes all configured target contents for ${table}. Type the source table name to continue:`);
+        if (confirmation !== table) return;
+        body.confirm = confirmation;
+      }
+      try {
+        await send(`/api/tables/${encodeURIComponent(table)}/${action}`, body);
+      } catch (error) {
+        document.getElementById("notice").textContent = `Action failed: ${error.message}`;
+      }
+    }
+    for (const action of ["pause", "initialize"]) {
+      document.getElementById(`${action}-all`).addEventListener("click", async () => {
+        const body = {};
+        if (action === "initialize") {
+          const confirmation = prompt("This deletes ALL configured target table contents. Type REINITIALIZE ALL to continue:");
+          if (confirmation !== "REINITIALIZE ALL") return;
+          body.confirm = confirmation;
+        }
+        try {
+          await send(`/api/all/${action}`, body);
+        } catch (error) {
+          document.getElementById("notice").textContent = `Action failed: ${error.message}`;
+        }
+      });
+    }
+    document.getElementById("capture-cutover").addEventListener("click", async () => {
+      if (!confirm("Stop primary writes and finish transactions first. If reading a replica, independently verify it has received and applied all primary changes. Capture this source's current binlog position?")) return;
+      try {
+        await send("/api/cutover/capture", {confirm: "CAPTURE SOURCE BARRIER"});
+        await refresh(false);
+      } catch (error) {
+        document.getElementById("notice").textContent = `Capture failed: ${error.message}`;
+      }
+    });
+    async function refresh(schedule = true) {
+      try {
+        const response = await fetch("/api/status");
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const progress = data.progress;
+        const summary = document.getElementById("progress");
+        summary.replaceChildren();
+        summary.append(el("span",
+          `${progress.caught_up_tables} / ${progress.total_tables} tables caught up to sampled source head`,
+          `badge ${progress.all_caught_up ? "running" : "catching_up"}`));
+        const cutover = progress.cutover;
+        const barrier = document.getElementById("cutover");
+        if (!cutover.position) {
+          barrier.textContent = "No source barrier captured.";
+        } else {
+          barrier.textContent = `Captured: ${position(cutover.position)} at ${cutover.captured_at}`;
+          const message = cutover.ready
+            ? "SOURCE BARRIER REACHED: all configured workers are running, with zero backlog and an unchanged source head."
+            : !cutover.source_unchanged
+              ? "NOT READY: source head changed or is unavailable. Review writes/source status before capturing again."
+              : "NOT READY: waiting for all configured workers to be running and reach the source barrier.";
+          summary.append(el("small", message, cutover.ready ? "badge running" : "badge catching_up"));
+        }
+        const servers = document.getElementById("servers");
+        servers.replaceChildren();
+        for (const [role, info] of Object.entries(data.servers)) {
+          const card = el("section", undefined, "card");
+          card.append(el("div", `${role} server`, "label"), el("div", info.host, "value"),
+            el("div", `Database: ${info.database}`, "subtle"),
+            el("div", `Binlog head: ${position(info.binlog)}`, "value"));
+          if (info.error) card.append(el("div", info.error, "error-text"));
+          servers.append(card);
+        }
+        const rows = document.getElementById("tables");
+        rows.replaceChildren();
+        for (const table of data.tables) {
+          const row = el("tr"), name = el("td"), state = el("td"), actions = el("td");
+          name.append(el("strong", table.table));
+          for (const target of table.targets) name.append(el("small", `-> ${target}`, "subtle"));
+          state.append(el("span", table.status, `badge ${table.status}`));
+          if (table.error) state.append(el("small", table.error, "error-text"));
+          if (table.status === "catching_up") state.append(el("small", `Initial barrier: ${position(table.barrier)}`));
+          for (const [action, label] of [["pause", "Pause"], ["resume", "Resume"], ["initialize", "Initialize"]]) {
+            const button = el("button", label, action === "initialize" ? "danger" : "");
+            button.addEventListener("click", () => command(table.table, action));
+            actions.append(button);
+          }
+          row.append(name, state, el("td", table.snapshot_rows.toLocaleString()),
+            el("td", table.changes.toLocaleString()), el("td", position(table.checkpoint)),
+            el("td", table.lag.error || `${table.lag.bytes.toLocaleString()} bytes / ${table.lag.files} file transitions`,
+              table.lag.error ? "error-text" : ""),
+            el("td", cutover.position ? (table.lag.cutover_reached ? "Reached" : "Not reached / worker not running") : "Not captured"),
+            el("td", table.last_event_at || "No changes yet"), actions);
+          rows.append(row);
+        }
+        document.getElementById("updated").textContent = `Last refreshed: ${new Date().toLocaleString()}`;
+      } catch (error) {
+        document.getElementById("updated").textContent = `Refresh failed: ${error.message}`;
+        document.getElementById("progress").textContent = `Monitoring unavailable: ${error.message}. Do not use stale readiness.`;
+      } finally {
+        if (schedule) setTimeout(refresh, 3000);
+      }
+    }
+    refresh();
+  </script>
+</body>
+</html>

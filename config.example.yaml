@@ -1,0 +1,47 @@
+source:
+  host: gphinblue-poc-rep.mysql.database.azure.com
+  port: 3306
+  user: cdc_reader
+  password_env: CDC_SOURCE_PASSWORD
+  database: source_db
+  # Optional: PEM CA bundle. Omit to use the operating system trust store.
+  # ssl_ca: C:\certificates\mysql-ca.pem
+
+target:
+  host: gphingreen-poc.mysql.database.azure.com
+  port: 3306
+  user: cdc_writer
+  password_env: CDC_TARGET_PASSWORD
+  database: replica_db
+  # Set true only for replication targets where unenforced foreign keys are acceptable.
+  disable_foreign_key_checks: false
+  # ssl_ca: C:\certificates\mysql-ca.pem
+
+settings:
+  # Reserve a unique range of replication client IDs for this application.
+  server_id_start: 71000
+  batch_size: 1000
+  poll_seconds: 2
+  metadata_table: _python_cdc_state
+  # Existing checkpoints resume automatically. New tables require Initialize.
+  auto_start: true
+
+web:
+  host: 127.0.0.1
+  port: 8080
+
+tables:
+  - source: customers
+    targets:
+      # First target: pre-created with the same schema as the source.
+      - table: customers_copy
+      # Second target: renamed/subset columns plus optional constants.
+      - database: replica_db
+        table: customers_projection
+        columns:
+          id: customer_id
+          name: display_name
+          email: email_address
+        constants:
+          origin: blue
+        # Unmapped target columns must be nullable or have defaults.

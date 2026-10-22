@@ -1,0 +1,4 @@
+Flask>=3.1,<4
+PyMySQL[rsa]>=1.1.1,<2
+mysql-replication>=1.0.17,<2
+PyYAML>=6.0.2,<7
